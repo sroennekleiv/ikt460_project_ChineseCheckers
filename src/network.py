@@ -27,15 +27,17 @@ class PolicyValueNetwork(nn.Module):
     HIDDEN_SIZE = 256
     NUM_BLOCKS  = 4
 
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, hidden_size=None, num_blocks=None):
         super().__init__()
-        self.input_projection = nn.Linear(state_size, self.HIDDEN_SIZE)
-        self.input_norm       = nn.LayerNorm(self.HIDDEN_SIZE)
+        self.hidden_size = int(hidden_size or self.HIDDEN_SIZE)
+        self.num_blocks = int(num_blocks or self.NUM_BLOCKS)
+        self.input_projection = nn.Linear(state_size, self.hidden_size)
+        self.input_norm       = nn.LayerNorm(self.hidden_size)
         self.residual_blocks  = nn.ModuleList(
-            [ResidualBlock(self.HIDDEN_SIZE) for _ in range(self.NUM_BLOCKS)]
+            [ResidualBlock(self.hidden_size) for _ in range(self.num_blocks)]
         )
-        self.policy_head = nn.Linear(self.HIDDEN_SIZE, action_size)
-        self.value_head  = nn.Linear(self.HIDDEN_SIZE, 1)
+        self.policy_head = nn.Linear(self.hidden_size, action_size)
+        self.value_head  = nn.Linear(self.hidden_size, 1)
 
     def forward(self, x):
         x = F.relu(self.input_norm(self.input_projection(x)))

@@ -51,9 +51,13 @@ PINS_PER_PLAYER = 10
 
 class BoardGUI:
 
-    def __init__(self, board: HexBoard, pins):
+    def __init__(self, board: HexBoard, pins, player_roles=None):
         self.board = board
         self.pins  = pins
+        self._player_roles = {
+            str(color): str(role)
+            for color, role in (player_roles or {}).items()
+        }
 
         self._selected_pin   = None
         self._valid_dests    = []
@@ -168,10 +172,13 @@ class BoardGUI:
 
         self.draw_board()
         self.draw_pins()
+        if self._player_roles:
+            self._status_text.set(self._matchup_status())
 
     def _build_player_row(self, parent, color):
         main_color = _PIN.get(color, ("#888", "#ccc", "#444"))[0]
         label_text = _LABEL.get(color, color.upper())
+        role_text = self._player_roles.get(str(color), "")
 
         header = tk.Frame(parent, bg=_PANEL_BG)
         header.pack(fill="x", padx=12, pady=(6, 0))
@@ -193,6 +200,11 @@ class BoardGUI:
             header, text=label_text, bg=_PANEL_BG, fg=_TEXT_MAIN,
             font=("Helvetica", 9, "bold"), padx=6
         ).pack(side="left")
+        if role_text:
+            tk.Label(
+                header, text=f"({role_text})", bg=_PANEL_BG, fg=_TEXT_DIM,
+                font=("Helvetica", 8)
+            ).pack(side="left")
 
         # Each row gets a 10-dot strip because every player is always trying to
         # get exactly 10 pins home.
@@ -246,6 +258,14 @@ class BoardGUI:
                 dot.create_oval(2, 2, 9, 9, fill=main_color, outline="", tags="dot")
             else:
                 dot.create_oval(2, 2, 9, 9, fill=_PANEL_BG, outline=_TEXT_DIM, tags="dot")
+
+    def _matchup_status(self):
+        parts = []
+        for color in self._player_colors:
+            role = self._player_roles.get(str(color), "")
+            if role:
+                parts.append(f"{_LABEL.get(color, color.upper())}={role}")
+        return " | ".join(parts) if parts else "Setting up game…"
 
     def _to_canvas(self, x, y):
         return x * self.scale + self.offset_x, y * self.scale + self.offset_y

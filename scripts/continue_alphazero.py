@@ -1,5 +1,6 @@
 # Continue AlphaZero training from the strongest saved checkpoint.
 
+import json
 import math
 import os
 import random
@@ -32,6 +33,7 @@ from src.paths import (
     ALPHAZERO_CHECKPOINT_DIR,
     ALPHAZERO_EXTERNAL_MODEL,
     ALPHAZERO_FINAL_MODEL,
+    ALPHAZERO_HISTORY_JSON,
     ALPHAZERO_LEARNING_CURVE,
     ALPHAZERO_TRAINED_MODEL,
     ensure_project_dirs,
@@ -40,11 +42,16 @@ from src.paths import (
 from src.perspective import PLAYABLE_COLOR_PAIRS, color_pair_for_game
 from src.training import (
     arena,
+    arena_against_pool,
     blended_external_score,
     evaluate,
+    evaluate_by_pair,
+    evaluate_by_pair_with_override,
     evaluate_with_override,
+    build_checkpoint_pool,
     load_candidate_agent,
     run_game,
+    weakest_pair_summary,
     ARENA_GAMES,
     EVAL_GAMES,
     MAX_TURNS,
@@ -61,8 +68,14 @@ CONTINUATION_CURRICULUM_ROUNDS   = 10
 POST_CURRICULUM_TEACHER_INTERVAL  = 6
 PROMOTION_SCORE_TOLERANCE         = 12.0
 NO_IMPROVE_PATIENCE_ROUNDS        = 24
+PAIR_EVAL_GAMES                   = 4
+HISTORICAL_POOL_SIZE              = 4
+HISTORICAL_SELFPLAY_INTERVAL      = 4
+HISTORICAL_LEAGUE_THRESHOLD       = 50.0
+HISTORICAL_WEAKEST_THRESHOLD      = 45.0
+LANE_SCORE_TOLERANCE              = 8.0
 
-def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, greedy_opponent):
+def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, greedy_opponent, opponent_pool=None):
     batch_examples = []
     first_wins = second_wins = draws = 0
     pins, steps = [], []
@@ -70,6 +83,8 @@ def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, 
     selfplay_games = 0
     greedy_games = 0
     easy_games = 0
+    historical_games = 0
+    pool = list(opponent_pool or [])
 
     # A light teacher mix helps continuation runs avoid drifting into odd
     # first-player habits without giving up the benefits of mostly self-play.
@@ -78,10 +93,14 @@ def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, 
     # Even later continuation rounds keep a light teacher mix to avoid drift.
     for game in range(games):
         player_colors = color_pair_for_game(round_index * max(1, games) + game)
+        historical_entry = None
         if curriculum_active and game % 3 == 0:
             opponent = greedy_opponent
         elif curriculum_active and game % 3 == 1:
             opponent = easy_opponent
+        elif pool and round_index >= 2 and game % HISTORICAL_SELFPLAY_INTERVAL == 0:
+            historical_entry = pool[(round_index + game) % len(pool)]
+            opponent = historical_entry["agent"]
         elif (not curriculum_active) and game % POST_CURRICULUM_TEACHER_INTERVAL == 0:
             opponent = greedy_opponent
         elif (not curriculum_active) and game % POST_CURRICULUM_TEACHER_INTERVAL == 1:
@@ -90,7 +109,9 @@ def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, 
             opponent = None
 
         if opponent is not None:
-            if opponent is greedy_opponent:
+            if historical_entry is not None:
+                historical_games += 1
+            elif opponent is greedy_opponent:
                 greedy_games += 1
             else:
                 easy_games += 1
@@ -128,6 +149,7 @@ def generate_selfplay_batch(best_agent, agent_for_encoding, games, round_index, 
         "selfplay_games": selfplay_games,
         "greedy_games": greedy_games,
         "easy_games": easy_games,
+        "historical_games": historical_games,
     }
 
 def save_curve(history, label):
@@ -160,14 +182,13 @@ def save_curve(history, label):
     plt.plot(history["train_game"], history["policy_loss"], "b-", alpha=0.8, label="Policy loss")
     plt.plot(history["train_game"], history["value_loss"],  "r-", alpha=0.8, label="Value loss")
     plt.ylabel("Loss")
-    plt.xlabel("Self-play games (continuation)")
+    plt.xlabel("Self-play games (total)")
     plt.legend(fontsize=8)
     plt.grid(alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(curve_path, dpi=100)
     plt.close()
-    print(f"       curve -> {curve_path}")
 
 def main():
     ensure_project_dirs()
@@ -221,8 +242,17 @@ def main():
     # The baseline should reflect the real MCTS model we are trying to improve,
     # not a hybrid mode that would hide regressions.
     best_agent.afterstate_search_override = False
-    baseline_easy_wr,   baseline_easy_pins,   _ = evaluate(best_agent, easy_opponent)
-    baseline_greedy_wr, baseline_greedy_pins, _ = evaluate(best_agent, greedy_opponent)
+    baseline_easy_wr, baseline_easy_pins, _ = evaluate(best_agent, easy_opponent)
+    baseline_greedy_pair_eval = evaluate_by_pair_with_override(
+        best_agent,
+        greedy_opponent,
+        games_per_pair=PAIR_EVAL_GAMES,
+        hybrid=False,
+    )
+    baseline_greedy_wr = baseline_greedy_pair_eval["overall_win_rate"]
+    baseline_greedy_pins = baseline_greedy_pair_eval["overall_pins"]
+    best_lane_summary = weakest_pair_summary(baseline_greedy_pair_eval["pairs"])
+    best_lane_floor = best_lane_summary["score"]
     best_agent.afterstate_search_override = True
 
     best_external_score = blended_external_score(
@@ -238,21 +268,31 @@ def main():
           f"Sims  {best_agent.num_simulations}")
     print(f"  Baseline     Greedy {baseline_greedy_wr:.0f}%  pins {baseline_greedy_pins:.1f}   "
           f"score {best_external_score:.1f}   promote at {PROMOTION_THRESHOLD:.0f}%")
+    print(f"  Weakest lane {best_lane_summary['pair']}   score {best_lane_floor:.1f}")
     print()
     print("Training")
     print()
 
-    history = {
-        "round_game":       [],
-        "eval_wins_easy":   [],
-        "eval_pins_easy":   [],
-        "eval_wins_greedy": [],
-        "eval_pins_greedy": [],
-        "arena_score":      [],
-        "train_game":       [],
-        "policy_loss":      [],
-        "value_loss":       [],
-    }
+    # Load accumulated history from previous runs so the learning curve is
+    # continuous across all training phases, not just this continuation.
+    if ALPHAZERO_HISTORY_JSON.exists():
+        with open(ALPHAZERO_HISTORY_JSON) as _f:
+            history = json.load(_f)
+        history_offset = history["round_game"][-1] if history["round_game"] else 0
+        print(f"  History      loaded {len(history['round_game'])} prior rounds   offset={history_offset} games")
+    else:
+        history = {
+            "round_game":       [],
+            "eval_wins_easy":   [],
+            "eval_pins_easy":   [],
+            "eval_wins_greedy": [],
+            "eval_pins_greedy": [],
+            "arena_score":      [],
+            "train_game":       [],
+            "policy_loss":      [],
+            "value_loss":       [],
+        }
+        history_offset = 0
 
     last_stats    = {"policy_loss": 0.0, "value_loss": 0.0}
     best_score    = float("-inf")
@@ -267,9 +307,27 @@ def main():
         games_this_round = min(batch_games, total_games - games_seen)
         games_seen += games_this_round
 
+        historical_pool = build_checkpoint_pool(
+            state_size,
+            guide_path,
+            exclude_paths=(
+                ALPHAZERO_BEST_MODEL,
+                ALPHAZERO_EXTERNAL_MODEL,
+                ALPHAZERO_TRAINED_MODEL,
+                ALPHAZERO_FINAL_MODEL,
+            ),
+            limit=HISTORICAL_POOL_SIZE,
+        )
+
         # One round means: gather self-play, train a challenger, then test it.
-        batch_info = generate_selfplay_batch(best_agent, best_agent, games_this_round,
-                                             round_index, greedy_opponent)
+        batch_info = generate_selfplay_batch(
+            best_agent,
+            best_agent,
+            games_this_round,
+            round_index,
+            greedy_opponent,
+            opponent_pool=historical_pool,
+        )
         replay_buffer.extend(batch_info["examples"])
 
         challenger.copy_weights_from(best_agent)
@@ -284,8 +342,17 @@ def main():
         # folded into priors, but without the stronger Afterstate search override.
         best_agent.afterstate_search_override  = False
         easy_wr,   easy_pins,   _ = evaluate_with_override(challenger, easy_opponent,   hybrid=False)
-        greedy_wr, greedy_pins, _ = evaluate_with_override(challenger, greedy_opponent, hybrid=False)
+        greedy_pair_eval = evaluate_by_pair_with_override(
+            challenger,
+            greedy_opponent,
+            games_per_pair=PAIR_EVAL_GAMES,
+            hybrid=False,
+        )
+        greedy_wr = greedy_pair_eval["overall_win_rate"]
+        greedy_pins = greedy_pair_eval["overall_pins"]
+        challenger_lane_summary = weakest_pair_summary(greedy_pair_eval["pairs"])
         arena_result = arena(challenger, best_agent)
+        historical_league = arena_against_pool(challenger, historical_pool, games=ARENA_GAMES)
         best_agent.afterstate_search_override  = True
 
         external_score = blended_external_score(greedy_wr, greedy_pins, easy_wr, easy_pins)
@@ -293,17 +360,29 @@ def main():
         decisive_arena = arena_result["wins"] > arena_result["losses"]
         improved_external = external_score > best_external_score
         promotion_floor = best_external_score - PROMOTION_SCORE_TOLERANCE
+        lane_ok = challenger_lane_summary["score"] >= best_lane_floor - LANE_SCORE_TOLERANCE
+        league_ok = (
+            not historical_pool
+            or (
+                historical_league["score_percent"] >= HISTORICAL_LEAGUE_THRESHOLD
+                and historical_league["weakest"]["score_percent"] >= HISTORICAL_WEAKEST_THRESHOLD
+            )
+        )
 
         promoted = (
             arena_result["score_percent"] >= PROMOTION_THRESHOLD
             and decisive_arena
             and (improved_external or external_score >= promotion_floor)
+            and lane_ok
+            and league_ok
         )
 
         if promoted:
             best_agent.copy_weights_from(challenger)
             challenger.save_model(ALPHAZERO_BEST_MODEL)
             promotions += 1
+            best_lane_floor = challenger_lane_summary["score"]
+            best_lane_summary = challenger_lane_summary
 
         if improved_external:
             challenger.save_model(ALPHAZERO_EXTERNAL_MODEL)
@@ -338,35 +417,62 @@ def main():
         )
         print(f"       eval EasyRandom  wins={easy_wr:4.1f}%   pins={easy_pins:.1f}/10")
         print(f"       eval Greedy      wins={greedy_wr:4.1f}%   pins={greedy_pins:.1f}/10")
+        print(
+            f"       weakest lane     {challenger_lane_summary['pair']}   "
+            f"score={challenger_lane_summary['score']:.1f}   "
+            f"wins={challenger_lane_summary['win_rate']:.1f}%   "
+            f"pins={challenger_lane_summary['avg_pins']:.1f}/10"
+        )
         print(f"       external score   {external_score:.1f}   (best so far {best_external_score:.1f})")
         print(
             f"       arena vs best    score={arena_result['score_percent']:4.1f}%   "
             f"wins={arena_result['wins']}  losses={arena_result['losses']}  draws={arena_result['draws']}"
         )
+        if historical_pool:
+            print(
+                f"       league vs pool   score={historical_league['score_percent']:4.1f}%   "
+                f"matchups={historical_league['matchup_wins']}-{historical_league['matchup_losses']}-"
+                f"{historical_league['matchup_draws']}   weakest={historical_league['weakest']['name']} "
+                f"({historical_league['weakest']['score_percent']:.1f}%)"
+            )
         print(
             f"       batch mix        self-play={batch_info['selfplay_games']:2d}   "
-            f"greedy={batch_info['greedy_games']:2d}   easy={batch_info['easy_games']:2d}"
+            f"greedy={batch_info['greedy_games']:2d}   easy={batch_info['easy_games']:2d}   "
+            f"historical={batch_info['historical_games']:2d}"
         )
         if promoted:
             print("       promoted challenger to best model")
         elif arena_result["score_percent"] >= PROMOTION_THRESHOLD and decisive_arena:
-            print(
-                f"       promotion blocked: external score {external_score:.1f} "
-                f"below floor {promotion_floor:.1f}"
-            )
+            if not lane_ok:
+                print(
+                    f"       promotion blocked: weakest lane {challenger_lane_summary['pair']} "
+                    f"fell below floor {best_lane_floor - LANE_SCORE_TOLERANCE:.1f}"
+                )
+            elif not league_ok and historical_pool:
+                print(
+                    f"       promotion blocked: league score {historical_league['score_percent']:.1f}% "
+                    f"or weakest matchup {historical_league['weakest']['score_percent']:.1f}% was too low"
+                )
+            else:
+                print(
+                    f"       promotion blocked: external score {external_score:.1f} "
+                    f"below floor {promotion_floor:.1f}"
+                )
         if improved_external:
             print(f"       *** new best external score — saved {ALPHAZERO_EXTERNAL_MODEL.name}")
 
-        history["round_game"].append(games_seen)
+        history["round_game"].append(games_seen + history_offset)
         history["eval_wins_easy"].append(easy_wr)
         history["eval_pins_easy"].append(easy_pins)
         history["eval_wins_greedy"].append(greedy_wr)
         history["eval_pins_greedy"].append(greedy_pins)
         history["arena_score"].append(arena_result["score_percent"])
-        history["train_game"].append(games_seen)
+        history["train_game"].append(games_seen + history_offset)
         history["policy_loss"].append(last_stats["policy_loss"])
         history["value_loss"].append(last_stats["value_loss"])
         save_curve(history, run_label)
+        with open(ALPHAZERO_HISTORY_JSON, "w") as _f:
+            json.dump(history, _f)
 
         if (round_index + 1) % CHECKPOINT_EVERY == 0:
             ckpt = ALPHAZERO_CHECKPOINT_DIR / f"cont_round{round_index + 1}.pth"
@@ -387,6 +493,13 @@ def main():
     # instead of blindly trusting whichever one happened to be promoted last.
     pure_easy_wr,   pure_easy_pins,   _ = evaluate_with_override(best_agent, easy_opponent,   hybrid=False)
     pure_greedy_wr, pure_greedy_pins, _ = evaluate_with_override(best_agent, greedy_opponent, hybrid=False)
+    pure_greedy_pair_eval = evaluate_by_pair_with_override(
+        best_agent,
+        greedy_opponent,
+        games_per_pair=PAIR_EVAL_GAMES,
+        hybrid=False,
+    )
+    pure_lane_summary = weakest_pair_summary(pure_greedy_pair_eval["pairs"])
     pure_best_score = blended_external_score(pure_greedy_wr, pure_greedy_pins, pure_easy_wr, pure_easy_pins)
 
     selection_note = "kept promoted best model"
@@ -397,21 +510,51 @@ def main():
         ext_easy_wr,   ext_easy_pins,   _ = evaluate_with_override(external_agent, easy_opponent,   hybrid=False)
         ext_greedy_wr, ext_greedy_pins, _ = evaluate_with_override(external_agent, greedy_opponent, hybrid=False)
         ext_score   = blended_external_score(ext_greedy_wr, ext_greedy_pins, ext_easy_wr, ext_easy_pins)
+        ext_pair_eval = evaluate_by_pair_with_override(
+            external_agent,
+            greedy_opponent,
+            games_per_pair=PAIR_EVAL_GAMES,
+            hybrid=False,
+        )
+        ext_lane_summary = weakest_pair_summary(ext_pair_eval["pairs"])
+        historical_pool = build_checkpoint_pool(
+            state_size,
+            guide_path,
+            exclude_paths=(
+                ALPHAZERO_BEST_MODEL,
+                ALPHAZERO_EXTERNAL_MODEL,
+                ALPHAZERO_TRAINED_MODEL,
+                ALPHAZERO_FINAL_MODEL,
+            ),
+            limit=HISTORICAL_POOL_SIZE,
+        )
         ext_arena   = arena(external_agent, best_agent)
+        ext_league  = arena_against_pool(external_agent, historical_pool, games=ARENA_GAMES)
         external_candidate_summary = {
             "score":      ext_score,
             "arena":      ext_arena,
+            "league":     ext_league,
             "easy_wr":    ext_easy_wr,
             "easy_pins":  ext_easy_pins,
             "greedy_wr":  ext_greedy_wr,
             "greedy_pins": ext_greedy_pins,
+            "lane":       ext_lane_summary,
         }
         prefer_external = (
             ext_arena["wins"] > ext_arena["losses"]
             and ext_score >= pure_best_score + 3.0
+            and ext_lane_summary["score"] >= pure_lane_summary["score"] - LANE_SCORE_TOLERANCE
+            and (
+                not historical_pool
+                or (
+                    ext_league["score_percent"] >= HISTORICAL_LEAGUE_THRESHOLD
+                    and ext_league["weakest"]["score_percent"] >= HISTORICAL_WEAKEST_THRESHOLD
+                )
+            )
         ) or (
             ext_score >= pure_best_score + 8.0
             and ext_arena["score_percent"] >= 50.0
+            and ext_lane_summary["score"] >= pure_lane_summary["score"] - LANE_SCORE_TOLERANCE
         )
         if prefer_external:
             best_agent.copy_weights_from(external_agent)
@@ -419,6 +562,7 @@ def main():
             pure_easy_wr, pure_easy_pins     = ext_easy_wr,   ext_easy_pins
             pure_greedy_wr, pure_greedy_pins = ext_greedy_wr, ext_greedy_pins
             pure_best_score = ext_score
+            pure_lane_summary = ext_lane_summary
         else:
             selection_note = "kept promoted best over external candidate"
 
@@ -444,6 +588,10 @@ def main():
         print(
             f"  External cand. score {ec['score']:.1f}   "
             f"arena {ec['arena']['wins']}-{ec['arena']['losses']}-{ec['arena']['draws']}"
+        )
+        print(
+            f"  External lane  {ec['lane']['pair']}   score {ec['lane']['score']:.1f}   "
+            f"league {ec['league']['score_percent']:.1f}%"
         )
     print()
     print("Final pure MCTS+guide results")

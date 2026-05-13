@@ -31,6 +31,12 @@ random.seed()
 SUPPORTED_PLAYER_COUNTS = {2, 3, 4, 6}
 OPENING_EXPLORATION_TURNS = 12
 SELFPLAY_STYLE_MODES = {"asvr", "asvg", "asvm", "azvr", "azvg", "azvm", "azvas"}
+TWO_PLAYER_BASE_COLORS = ["red", "lawn green", "yellow"]
+RANDOM_TWO_PLAYER_MODES = {
+    "hvh", "hvrandom", "hvgreedy", "gvr", "rvr", "gvg",
+    "hvminimax", "mvm", "hvafter", "asvr", "asvg", "asvm",
+    "hvalpha", "azvr", "azvg", "azvm", "azvas",
+}
 
 def load_afterstate_agent():
     # Local play always uses this fixed state size, so we can load the model
@@ -112,56 +118,66 @@ def remember_move(recent_moves, current_player, pin_id, old_cell, new_cell):
     if len(recent_moves) > 30:
         recent_moves.pop(0)
 
-def configure_player_colors_for_mode(game, game_mode, player_colors):
-    # The GUI always uses the yellow/purple lane for trained-agent demos. The
-    # models themselves can handle the other lanes, but fixing the local lane
-    # keeps screenshots, debugging, and side labels much easier to follow.
-    fixed_color_messages = {
-        "hvafter":("Afterstate mode uses fixed colours: AFTERSTATE=YELLOW, HUMAN=PURPLE.",
-                   "This GUI demo keeps yellow/purple fixed for consistency."),
-        "asvr":   ("Afterstate vs Random uses fixed colours: AFTERSTATE=YELLOW, RANDOM=PURPLE.",),
-        "asvg":   ("Afterstate vs Greedy uses fixed colours: AFTERSTATE=YELLOW, GREEDY=PURPLE.",),
-        "asvm":   ("Afterstate vs Minimax uses fixed colours: AFTERSTATE=YELLOW, MINIMAX=PURPLE.",),
-        "hvalpha":("AlphaZero mode uses fixed colours: ALPHAZERO=YELLOW, HUMAN=PURPLE.",
-                   "This GUI demo keeps yellow/purple fixed for consistency."),
-        "azvr":   ("AlphaZero vs Random uses fixed colours: ALPHAZERO=YELLOW, RANDOM=PURPLE.",),
-        "azvg":   ("AlphaZero vs Greedy uses fixed colours: ALPHAZERO=YELLOW, GREEDY=PURPLE.",),
-        "azvm":   ("AlphaZero vs Minimax uses fixed colours: ALPHAZERO=YELLOW, MINIMAX=PURPLE.",),
+def _mode_player_labels(game_mode):
+    labels = {
+        "hvh": ("Human 1", "Human 2"),
+        "hvrandom": ("Human", "Random"),
+        "hvgreedy": ("Human", "Greedy"),
+        "gvr": ("Greedy", "Random"),
+        "rvr": ("Random", "Random"),
+        "gvg": ("Greedy", "Greedy"),
+        "hvminimax": ("Human", "Minimax"),
+        "mvm": ("Minimax", "Minimax"),
+        "hvafter": ("Afterstate", "Human"),
+        "asvr": ("Afterstate", "Random"),
+        "asvg": ("Afterstate", "Greedy"),
+        "asvm": ("Afterstate", "Minimax"),
+        "hvalpha": ("AlphaZero", "Human"),
+        "azvr": ("AlphaZero", "Random"),
+        "azvg": ("AlphaZero", "Greedy"),
+        "azvm": ("AlphaZero", "Minimax"),
+        "azvas": ("Afterstate", "AlphaZero"),
     }
-    trained_lane_modes = {
-        "hvafter", "asvr", "asvg", "asvm",
-        "hvalpha", "azvr", "azvg", "azvm", "azvas",
-    }
-    trained_lane_random_messages = {
-        "azvas": (
-            "Afterstate vs AlphaZero uses the yellow/purple demo lane with random side assignment.",
-            "Afterstate and AlphaZero can both play either side; the starting side is reshuffled each game.",
-        ),
-        "asvr": ("Afterstate vs Random uses the yellow/purple demo lane with random side assignment.",),
-        "asvg": ("Afterstate vs Greedy uses the yellow/purple demo lane with random side assignment.",),
-        "asvm": ("Afterstate vs Minimax uses the yellow/purple demo lane with random side assignment.",),
-        "azvr": ("AlphaZero vs Random uses the yellow/purple demo lane with random side assignment.",),
-        "azvg": ("AlphaZero vs Greedy uses the yellow/purple demo lane with random side assignment.",),
-        "azvm": ("AlphaZero vs Minimax uses the yellow/purple demo lane with random side assignment.",),
+    return labels.get(game_mode)
+
+def build_player_roles(game_mode, player_colors):
+    if len(player_colors) != 2:
+        return {}
+    labels = _mode_player_labels(game_mode)
+    if labels is None:
+        return {}
+    return {
+        str(player_colors[index]): labels[index]
+        for index in range(min(len(player_colors), len(labels)))
     }
 
-    if game_mode in trained_lane_modes:
-        colours = ["yellow", "purple"]
-        if game_mode in SELFPLAY_STYLE_MODES:
-            random.shuffle(colours)
+def _sample_two_player_colours(game):
+    base_colour = random.choice(TWO_PLAYER_BASE_COLORS)
+    colours = [base_colour, game.board.colour_opposites[base_colour]]
+    random.shuffle(colours)
+    return colours
+
+def _announce_side_assignment(game_mode, colours):
+    labels = _mode_player_labels(game_mode)
+    if labels is None:
+        return
+    first_label, second_label = labels
+    print(f"Controllers this game: {first_label.upper()}={colours[0].upper()}, {second_label.upper()}={colours[1].upper()}.")
+    print(f"Turn order this game: {colours[0].upper()} moves first, {colours[1].upper()} moves second.")
+
+def configure_player_colors_for_mode(game, game_mode, player_colors):
+    # Local two-player demos reshuffle both the active opposite-colour lane and
+    # which side moves first so it is easy to spot colour-pair quirks by eye.
+    if game.num_players == 2 and game_mode in RANDOM_TWO_PLAYER_MODES:
+        colours = _sample_two_player_colours(game)
         game.sync_player_state(colours)
-        for line in trained_lane_random_messages.get(game_mode, fixed_color_messages.get(game_mode, ())):
-            print(line)
-        print(f"Side assignment this game: {colours[0].upper()} moves first, {colours[1].upper()} moves second.")
+        print("This two-player mode uses a random opposite-colour lane each game.")
+        print("Both the lane and the side assignment are reshuffled on every start.")
+        print(f"Active lane this game: {colours[0].upper()} vs {colours[1].upper()}.")
+        _announce_side_assignment(game_mode, colours)
         return colours
 
-    if game_mode not in fixed_color_messages:
-        return player_colors
-
-    for line in fixed_color_messages[game_mode]:
-        print(line)
-    game.sync_player_state(["yellow", "purple"])
-    return ["yellow", "purple"]
+    return player_colors
 
 def _get_ai_type(game_mode, current_player, player_colors):
     # The mode string decides which side, if any, should be controlled by an AI.
@@ -276,9 +292,12 @@ if __name__ == "__main__":
         print(f"Mode: {mode_labels.get(game_mode, game_mode)}")
 
         player_colors = configure_player_colors_for_mode(game, game_mode, player_colors)
+        player_roles = build_player_roles(game_mode, player_colors)
         pins_on_board = game.place_pins_to_board(player_colors)
 
         print("\nPlayers: " + ", ".join(c.upper() for c in player_colors))
+        if player_roles:
+            print("Controllers: " + ", ".join(f"{colour.upper()}={role}" for colour, role in player_roles.items()))
         print()
         board.print_ascii(pins=pins_on_board, empty="·")
 
@@ -290,7 +309,7 @@ if __name__ == "__main__":
             "minimax":   MinimaxAgent(depth=2)    if game_mode in ("hvminimax", "mvm", "asvm", "azvm") else None,
         }
 
-        gui = BoardGUI(board, pins_on_board)
+        gui = BoardGUI(board, pins_on_board, player_roles=player_roles)
         gui.window.update()
         game.timeout_manager = TimeoutManager(game.player_colors, turn_time_limit=60, game_time_limit=1800)
         game.timeout_manager.start_game_timer()

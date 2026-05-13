@@ -1,15 +1,24 @@
 # Shared AlphaZero training helpers.
 
 import torch
+from pathlib import Path
 
 from src.alphazero import AlphaZeroAgent, AlphaZeroBoardState
 from src.env import ChineseCheckersEnv
-from src.perspective import color_pair_for_game
+from src.paths import (
+    ALPHAZERO_BEST_MODEL,
+    ALPHAZERO_CHECKPOINT_DIR,
+    ALPHAZERO_EXTERNAL_MODEL,
+    ALPHAZERO_FINAL_MODEL,
+    ALPHAZERO_TRAINED_MODEL,
+)
+from src.perspective import PLAYABLE_COLOR_PAIRS, color_pair_for_game
 from src.rewards import model_selection_score
 
 # These defaults are tuned for the two-player training setup used by the
 # scripts in this project.
 MAX_TURNS                = 400
+MAX_REPETITIONS          = 6
 SELFPLAY_TEMP_TURNS      = 30
 ARENA_GAMES              = 8
 EVAL_GAMES               = 10
@@ -59,7 +68,7 @@ def run_game(first_controller, second_controller, agent,
     player_colors = list(player_colors or ["yellow", "purple"])
     env = ChineseCheckersEnv(
         num_players=2, player_colors=player_colors,
-        max_turns=MAX_TURNS, max_repetitions=200,
+        max_turns=MAX_TURNS, max_repetitions=MAX_REPETITIONS,
     )
     env.reset()
     controllers = {
@@ -150,6 +159,73 @@ def evaluate(agent, opponent, games=EVAL_GAMES):
         steps.append(result["steps"])
     return wins / games * 100.0, sum(pins) / games, sum(steps) / games
 
+def evaluate_by_pair(agent, opponent, games_per_pair=4):
+    # Pair-by-pair eval is slower, but it catches lane-specific weaknesses that
+    # disappear when all colours are merged into one average.
+    games_per_pair = max(2, int(games_per_pair))
+    if games_per_pair % 2 == 1:
+        games_per_pair += 1
+
+    pair_results = {}
+    total_wins = 0
+    total_pins = 0.0
+    total_steps = 0.0
+    total_games = 0
+
+    for pair_index, pair in enumerate(PLAYABLE_COLOR_PAIRS):
+        pair_key = f"{pair[0]}/{pair[1]}"
+        wins = 0
+        pins = []
+        steps = []
+
+        for game in range(games_per_pair):
+            if game % 2 == 0:
+                result = run_game(
+                    agent,
+                    opponent,
+                    agent,
+                    store_colours=set(),
+                    noisy=False,
+                    player_colors=pair,
+                )
+                agent_colour = pair[0]
+            else:
+                result = run_game(
+                    opponent,
+                    agent,
+                    agent,
+                    store_colours=set(),
+                    noisy=False,
+                    player_colors=pair,
+                )
+                agent_colour = pair[1]
+
+            if result["winner"] == agent_colour:
+                wins += 1
+                total_wins += 1
+            pins.append(result["pins_by_color"][agent_colour])
+            steps.append(result["steps"])
+            total_pins += result["pins_by_color"][agent_colour]
+            total_steps += result["steps"]
+            total_games += 1
+
+        pair_results[pair_key] = {
+            "pair": tuple(pair),
+            "games": games_per_pair,
+            "win_rate": 100.0 * wins / games_per_pair,
+            "avg_pins": sum(pins) / games_per_pair,
+            "avg_steps": sum(steps) / games_per_pair,
+            "pair_index": pair_index,
+        }
+
+    return {
+        "overall_win_rate": 100.0 * total_wins / max(1, total_games),
+        "overall_pins": total_pins / max(1, total_games),
+        "overall_steps": total_steps / max(1, total_games),
+        "pairs": pair_results,
+        "games": total_games,
+    }
+
 def evaluate_with_override(agent, opponent, games=EVAL_GAMES, hybrid=False):
     # Some reports want pure MCTS numbers and others want the hybrid override.
     # This helper flips the flag temporarily and then restores it.
@@ -161,6 +237,43 @@ def evaluate_with_override(agent, opponent, games=EVAL_GAMES, hybrid=False):
     finally:
         if prev is not None:
             agent.afterstate_search_override = prev
+
+def evaluate_by_pair_with_override(agent, opponent, games_per_pair=4, hybrid=False):
+    # Pair-by-pair checks need the same temporary override handling as the
+    # aggregate evaluation helper above.
+    prev = getattr(agent, "afterstate_search_override", None)
+    if prev is not None:
+        agent.afterstate_search_override = bool(hybrid)
+    try:
+        return evaluate_by_pair(agent, opponent, games_per_pair=games_per_pair)
+    finally:
+        if prev is not None:
+            agent.afterstate_search_override = prev
+
+def weakest_pair_summary(pair_results):
+    # The weakest lane is usually the first place where colour imbalance shows up.
+    scored_pairs = []
+    for pair_key, pair_result in pair_results.items():
+        pair_score = model_selection_score(pair_result["win_rate"], pair_result["avg_pins"])
+        scored_pairs.append((pair_score, pair_key, pair_result))
+
+    if not scored_pairs:
+        return {
+            "pair": "n/a",
+            "score": 0.0,
+            "win_rate": 0.0,
+            "avg_pins": 0.0,
+            "avg_steps": 0.0,
+        }
+
+    pair_score, pair_key, pair_result = min(scored_pairs, key=lambda item: item[0])
+    return {
+        "pair": pair_key,
+        "score": float(pair_score),
+        "win_rate": float(pair_result["win_rate"]),
+        "avg_pins": float(pair_result["avg_pins"]),
+        "avg_steps": float(pair_result["avg_steps"]),
+    }
 
 def blended_external_score(greedy_win_rate, greedy_pins, easy_win_rate, easy_pins):
     # Greedy is the main yardstick, but EasyRandom still catches obvious
@@ -179,8 +292,60 @@ def load_candidate_agent(state_size, model_path, guide_path, name):
     if not candidate.load_model(model_path, verbose=False):
         return None
     if guide_path.exists():
-        candidate.enable_afterstate_guide(guide_path)
+        candidate.enable_afterstate_guide(guide_path, verbose=False)
     return candidate
+
+def checkpoint_candidate_paths(exclude_paths=None, limit=4):
+    # Historical checkpoints make strong sparring partners because they expose
+    # older styles that the current best model may have forgotten how to beat.
+    exclude = {
+        str(Path(path).resolve())
+        for path in (exclude_paths or [])
+        if path is not None
+    }
+    seen = set()
+    candidates = []
+
+    ordered_paths = [
+        ALPHAZERO_EXTERNAL_MODEL,
+        ALPHAZERO_BEST_MODEL,
+        ALPHAZERO_TRAINED_MODEL,
+        ALPHAZERO_FINAL_MODEL,
+        *sorted(ALPHAZERO_CHECKPOINT_DIR.glob("*.pth"), key=lambda path: path.stat().st_mtime, reverse=True),
+    ]
+
+    for path in ordered_paths:
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in exclude or resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(path)
+        if len(candidates) >= int(limit):
+            break
+
+    return candidates
+
+def build_checkpoint_pool(state_size, guide_path, exclude_paths=None, limit=4):
+    # This loads a small pool of old AlphaZero checkpoints for league matches
+    # and historical self-play without polluting the main agent in memory.
+    pool = []
+    for path in checkpoint_candidate_paths(exclude_paths=exclude_paths, limit=limit):
+        candidate = load_candidate_agent(
+            state_size,
+            path,
+            guide_path,
+            name=f"Hist:{path.stem}",
+        )
+        if candidate is None:
+            continue
+        pool.append({
+            "name": candidate.name,
+            "path": path,
+            "agent": candidate,
+        })
+    return pool
 
 def challenger_score_from_result(result, challenger_colour):
     # Draws still carry signal, so the arena gives partial credit based on the
@@ -218,4 +383,40 @@ def arena(challenger, champion, games=ARENA_GAMES):
     return {
         "score_percent": 100.0 * total_score / games,
         "wins": wins, "losses": losses, "draws": draws,
+    }
+
+def arena_against_pool(challenger, opponent_pool, games=ARENA_GAMES):
+    # One arena can be noisy. A tiny league against older checkpoints is a much
+    # better test of whether the challenger is actually becoming more general.
+    if not opponent_pool:
+        return {
+            "score_percent": 100.0,
+            "matchup_wins": 0,
+            "matchup_losses": 0,
+            "matchup_draws": 0,
+            "matchups": [],
+            "weakest": None,
+        }
+
+    matchups = []
+    for candidate in opponent_pool:
+        result = arena(challenger, candidate["agent"], games=games)
+        matchups.append({
+            "name": candidate["name"],
+            "path": str(candidate["path"]),
+            **result,
+        })
+
+    matchup_wins = sum(1 for result in matchups if result["wins"] > result["losses"])
+    matchup_losses = sum(1 for result in matchups if result["wins"] < result["losses"])
+    matchup_draws = len(matchups) - matchup_wins - matchup_losses
+    weakest = min(matchups, key=lambda result: result["score_percent"])
+
+    return {
+        "score_percent": sum(result["score_percent"] for result in matchups) / len(matchups),
+        "matchup_wins": matchup_wins,
+        "matchup_losses": matchup_losses,
+        "matchup_draws": matchup_draws,
+        "matchups": matchups,
+        "weakest": weakest,
     }

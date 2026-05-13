@@ -376,8 +376,6 @@ class AfterstateValueAgent:
             "player_color": self.player_color,
             "board_perspective": "six_lane_rotation_v1",
         }, filepath)
-        print(f"Model saved to {filepath}")
-
     def load_model(self, filepath, verbose=True):
         checkpoint = torch.load(filepath, map_location="cpu")
         if checkpoint.get("state_size") != self.state_size:

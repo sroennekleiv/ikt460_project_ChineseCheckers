@@ -106,8 +106,28 @@ def _total_distance_to_target(board, positions, target_cells):
 
     return total
 
+def _repetition_positions_key(positions_by_colour):
+    # Repetition should care about the occupied cells, not which same-colour
+    # pin id happens to sit on each one.
+    return tuple(
+        sorted(
+            (str(colour), tuple(sorted(int(position) for position in positions)))
+            for colour, positions in positions_by_colour.items()
+        )
+    )
+
 class AlphaZeroBoardState:
-    def __init__(self, board, positions, current_player, player_order=None, move_count=0, max_turns=400):
+    def __init__(
+        self,
+        board,
+        positions,
+        current_player,
+        player_order=None,
+        move_count=0,
+        max_turns=400,
+        max_repetitions=6,
+        state_counts=None,
+    ):
         self.board = board
         self.player_order = tuple(_colour_list(board, player_order))
         self.positions = {
@@ -117,6 +137,8 @@ class AlphaZeroBoardState:
         self.current_player = str(current_player)
         self.move_count = int(move_count)
         self.max_turns = int(max_turns)
+        self.max_repetitions = int(max_repetitions)
+        self.state_counts = dict(state_counts or {})
 
     @classmethod
     def from_env(cls, env):
@@ -131,10 +153,22 @@ class AlphaZeroBoardState:
             player_order=colours,
             move_count=env.turn_count,
             max_turns=env.max_turns,
+            max_repetitions=env.max_repetitions,
+            state_counts=env.state_counts,
         )
 
     @classmethod
-    def from_board(cls, pins_on_board, current_player, board, player_order=None, move_count=0, max_turns=400):
+    def from_board(
+        cls,
+        pins_on_board,
+        current_player,
+        board,
+        player_order=None,
+        move_count=0,
+        max_turns=400,
+        max_repetitions=6,
+        state_counts=None,
+    ):
         colours = _colour_list(board, player_order or [current_player, board.colour_opposites.get(current_player, "")])
         positions = _positions_from_pins(pins_on_board, colours)
         return cls(
@@ -144,6 +178,8 @@ class AlphaZeroBoardState:
             player_order=colours,
             move_count=move_count,
             max_turns=max_turns,
+            max_repetitions=max_repetitions,
+            state_counts=state_counts,
         )
 
     def opponent_of(self, colour):
@@ -212,6 +248,10 @@ class AlphaZeroBoardState:
     def policy_index(self, action, player_color=None):
         pin_id, _ = action
         return int(pin_id) * 121 + self.reference_destination(action, player_color)
+
+    def repetition_key(self, current_player=None):
+        # Search should use the same repetition identity as the live environment.
+        return str(current_player or self.current_player), _repetition_positions_key(self.positions)
 
     def valid_actions(self, player_color=None):
         colour = str(player_color or self.current_player)
@@ -320,12 +360,20 @@ class AlphaZeroBoardState:
             player_order=self.player_order,
             move_count=self.move_count + 1,
             max_turns=self.max_turns,
+            max_repetitions=self.max_repetitions,
         )
 
         if next_state.pins_in_goal(mover) == len(next_state.positions.get(mover, ())):
             return next_state, True, {"winner": mover, "message": f"{mover} wins"}
 
         if next_state.move_count >= self.max_turns:
+            return next_state, True, {"winner": None, "message": "draw"}
+
+        next_counts = dict(self.state_counts)
+        repetition_key = next_state.repetition_key()
+        next_counts[repetition_key] = next_counts.get(repetition_key, 0) + 1
+        next_state.state_counts = next_counts
+        if next_state.max_repetitions > 0 and next_counts[repetition_key] >= next_state.max_repetitions:
             return next_state, True, {"winner": None, "message": "draw"}
 
         return next_state, False, {"winner": None, "message": ""}
@@ -369,6 +417,10 @@ class AlphaZeroAgent:
         self.root_progress_weight = 1.25
         self.root_race_weight = 0.0
         self.afterstate_guide_weight = 12.0
+        # Fresh training runs can use a slightly larger network, but older
+        # checkpoints still reload with their original architecture.
+        self.network_hidden_size = 384
+        self.network_num_blocks = 6
         self.afterstate_guide_network = None
         self.afterstate_guide_encoder = None
         self.afterstate_search_agent = None
@@ -381,19 +433,36 @@ class AlphaZeroAgent:
 
         # One optimizer update trains the policy head and value head together.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy_value_network = PolicyValueNetwork(self.state_size, self.action_size).to(self.device)
+        self._build_network_and_optimizer()
+        self.train_updates = 0
+
+    def _build_network_and_optimizer(self):
+        self.policy_value_network = PolicyValueNetwork(
+            self.state_size,
+            self.action_size,
+            hidden_size=self.network_hidden_size,
+            num_blocks=self.network_num_blocks,
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.policy_value_network.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        self.train_updates = 0
 
     def copy_weights_from(self, other):
+        if (
+            self.network_hidden_size != int(other.network_hidden_size)
+            or self.network_num_blocks != int(other.network_num_blocks)
+        ):
+            self.network_hidden_size = int(other.network_hidden_size)
+            self.network_num_blocks = int(other.network_num_blocks)
+            self._build_network_and_optimizer()
         self.policy_value_network.load_state_dict(other.policy_value_network.state_dict())
         self.optimizer.load_state_dict(other.optimizer.state_dict())
         self.num_simulations = int(other.num_simulations)
         self.c_puct = float(other.c_puct)
+        self.network_hidden_size = int(other.network_hidden_size)
+        self.network_num_blocks = int(other.network_num_blocks)
         self.heuristic_leaf_blend = float(other.heuristic_leaf_blend)
         self.progress_prior_weight = float(other.progress_prior_weight)
         self.root_progress_weight = float(other.root_progress_weight)
@@ -847,6 +916,48 @@ class AlphaZeroAgent:
     def add_examples(self, examples):
         self.training_buffer.extend(examples)
 
+    def _sample_training_batch(self):
+        # Plain random sampling can drift toward whichever result type is most
+        # common in the buffer. A small bucket balance keeps wins, losses, and
+        # draw-ish positions visible during training.
+        examples = list(self.training_buffer)
+        if len(examples) <= self.batch_size:
+            return list(examples)
+
+        positive = [example for example in examples if float(example[2]) > 0.5]
+        negative = [example for example in examples if float(example[2]) < -0.5]
+        neutral = [
+            example
+            for example in examples
+            if -0.5 <= float(example[2]) <= 0.5
+        ]
+
+        buckets = [bucket for bucket in (positive, negative, neutral) if bucket]
+        if len(buckets) <= 1:
+            return random.sample(examples, self.batch_size)
+
+        target_per_bucket = max(1, self.batch_size // len(buckets))
+        batch = []
+        used_ids = set()
+
+        for bucket in buckets:
+            take = min(len(bucket), target_per_bucket)
+            for example in random.sample(bucket, take):
+                batch.append(example)
+                used_ids.add(id(example))
+
+        if len(batch) < self.batch_size:
+            remainder = [example for example in examples if id(example) not in used_ids]
+            if len(remainder) >= self.batch_size - len(batch):
+                batch.extend(random.sample(remainder, self.batch_size - len(batch)))
+            else:
+                batch.extend(remainder)
+
+        if len(batch) > self.batch_size:
+            batch = random.sample(batch, self.batch_size)
+
+        return batch
+
     def supervised_update(self, states, policy_targets, masks, value_targets=None, epochs=3):
         if not states:
             return None
@@ -892,7 +1003,7 @@ class AlphaZeroAgent:
         if len(self.training_buffer) < self.batch_size:
             return None
 
-        batch = random.sample(self.training_buffer, self.batch_size)
+        batch = self._sample_training_batch()
         states = torch.FloatTensor([e[0] for e in batch]).to(self.device)
         target_policies = torch.stack([e[1] for e in batch]).to(self.device)
         target_values = torch.FloatTensor([e[2] for e in batch]).to(self.device)
@@ -929,6 +1040,8 @@ class AlphaZeroAgent:
                 "board_perspective_policy": "six_lane_destination_v1",
                 "num_simulations": self.num_simulations,
                 "c_puct": self.c_puct,
+                "network_hidden_size": self.network_hidden_size,
+                "network_num_blocks": self.network_num_blocks,
                 "heuristic_leaf_blend": self.heuristic_leaf_blend,
                 "progress_prior_weight": self.progress_prior_weight,
                 "root_progress_weight": self.root_progress_weight,
@@ -941,19 +1054,29 @@ class AlphaZeroAgent:
             },
             filepath,
         )
-        print(f"Model saved to {filepath}")
-
     def load_model(self, filepath, verbose=True):
         checkpoint = torch.load(filepath, map_location="cpu")
         if checkpoint.get("state_size") != self.state_size or checkpoint.get("action_size") != self.action_size:
             print("Warning: saved AlphaZero model shape does not match current code.")
             return False
 
+        target_hidden_size = int(checkpoint.get("network_hidden_size", 256))
+        target_num_blocks = int(checkpoint.get("network_num_blocks", 4))
+        if (
+            target_hidden_size != self.network_hidden_size
+            or target_num_blocks != self.network_num_blocks
+        ):
+            self.network_hidden_size = target_hidden_size
+            self.network_num_blocks = target_num_blocks
+            self._build_network_and_optimizer()
+
         try:
             self.policy_value_network.load_state_dict(checkpoint["policy_value_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.num_simulations = int(checkpoint.get("num_simulations", self.num_simulations))
             self.c_puct = float(checkpoint.get("c_puct", self.c_puct))
+            self.network_hidden_size = int(checkpoint.get("network_hidden_size", self.network_hidden_size))
+            self.network_num_blocks = int(checkpoint.get("network_num_blocks", self.network_num_blocks))
             self.heuristic_leaf_blend = float(checkpoint.get("heuristic_leaf_blend", self.heuristic_leaf_blend))
             self.progress_prior_weight = float(checkpoint.get("progress_prior_weight", self.progress_prior_weight))
             self.root_progress_weight = float(checkpoint.get("root_progress_weight", self.root_progress_weight))
@@ -967,6 +1090,7 @@ class AlphaZeroAgent:
                 print(f"Model loaded from {filepath}")
                 print(
                     f"Saved sims: {self.num_simulations}  "
+                    f"net: {self.network_hidden_size}x{self.network_num_blocks}  "
                     f"heuristic blend: {self.heuristic_leaf_blend:.2f}  "
                     f"progress prior: {self.progress_prior_weight:.2f}  "
                     f"root progress: {self.root_progress_weight:.2f}  "

@@ -187,6 +187,42 @@ def evaluate(label, first_agent, second_agent, games=20, max_turns=200):
     print(f"  avg first distance:     {sum(r['first_distance'] for r in results) / games:.2f}")
     print(f"  avg second distance:    {sum(r['second_distance'] for r in results) / games:.2f}")
 
+    by_pair = {}
+    for result in results:
+        pair = tuple(result["player_colors"])
+        bucket = by_pair.setdefault(pair, {
+            "games": 0,
+            "first_wins": 0,
+            "second_wins": 0,
+            "draws": 0,
+            "first_goal": 0.0,
+            "second_goal": 0.0,
+            "moves": 0.0,
+        })
+        bucket["games"] += 1
+        bucket["moves"] += result["moves"]
+        bucket["first_goal"] += result["first_goal"]
+        bucket["second_goal"] += result["second_goal"]
+        if result["result"] == f"{pair[0]} wins":
+            bucket["first_wins"] += 1
+        elif result["result"] == f"{pair[1]} wins":
+            bucket["second_wins"] += 1
+        else:
+            bucket["draws"] += 1
+
+    print("  by pair:")
+    for pair, bucket in sorted(by_pair.items()):
+        pair_label = f"{pair[0]}/{pair[1]}"
+        games_in_pair = max(1, bucket["games"])
+        print(
+            f"    {pair_label:<24} "
+            f"first={bucket['first_wins']:2d}  "
+            f"second={bucket['second_wins']:2d}  "
+            f"draws={bucket['draws']:2d}  "
+            f"pins={bucket['first_goal'] / games_in_pair:.2f}/{bucket['second_goal'] / games_in_pair:.2f}  "
+            f"moves={bucket['moves'] / games_in_pair:.1f}"
+        )
+
 if __name__ == "__main__":
     # The baseline checks always run so you can tell whether the environment or
     # move generator broke even when no trained model is present.

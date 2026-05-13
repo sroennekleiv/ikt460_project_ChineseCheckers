@@ -134,6 +134,22 @@ class ChineseCheckersEnv:
 
         return actions
 
+    def _board_state_key(self):
+        # Repetition depends on both the occupied cells and whose turn it is.
+        # Two identical layouts are not the same state if the side to move flipped.
+        positions_by_color = {}
+        for pin in self.pins_on_board:
+            colour = str(pin.color)
+            positions_by_color.setdefault(colour, []).append(int(pin.axialindex))
+
+        packed_positions = tuple(
+            sorted(
+                (colour, tuple(sorted(positions)))
+                for colour, positions in positions_by_color.items()
+            )
+        )
+        return str(self.get_current_player()), packed_positions
+
     def step(self, action):
         if self.done:
             return self.get_state(), 0, True, {"message": "Game already finished"}
@@ -172,7 +188,7 @@ class ChineseCheckersEnv:
 
         # Repetition draws stop endless back-and-forth cycles from producing
         # unbounded games and strange training targets.
-        board_key = tuple(sorted((p.color, p.axialindex) for p in self.pins_on_board))
+        board_key = self._board_state_key()
         self.state_counts[board_key] = self.state_counts.get(board_key, 0) + 1
         if self.state_counts[board_key] >= self.max_repetitions:
             self.done = True

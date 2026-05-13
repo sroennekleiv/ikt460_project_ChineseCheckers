@@ -31,6 +31,7 @@ ALPHAZERO_FINAL_MODEL = ALPHAZERO_MODEL_DIR / "final.pth"
 AFTERSTATE_LEARNING_CURVE = PLOTS_DIR / "afterstate_learning_curve.png"
 AFTERSTATE_PHASE2_LEARNING_CURVE = PLOTS_DIR / "afterstate_phase2_learning_curve.png"
 ALPHAZERO_LEARNING_CURVE = PLOTS_DIR / "alphazero_learning_curve.png"
+ALPHAZERO_HISTORY_JSON   = PLOTS_DIR / "alphazero_history.json"
 
 def ensure_project_dirs():
     # Training scripts call this before saving so a fresh clone can create the

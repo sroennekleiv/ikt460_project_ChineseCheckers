@@ -358,6 +358,69 @@ def _make_pins_on_board(server_state):
             proxies.append(_PinProxy(pin_id, colour, idx))
     return proxies
 
+def _pins_in_goal(server_state, colour):
+    positions = server_state.get("pins", {}).get(colour, [])
+    targets = _target_cells.get(colour, set())
+    return sum(1 for pos in positions if pos in targets)
+
+def _distance_to_goal(server_state, colour):
+    positions = list(server_state.get("pins", {}).get(colour, []))
+    return _total_dist(positions, _target_cells.get(colour, set()))
+
+def _progress_bar(count, total=10):
+    count = max(0, min(int(count), total))
+    return "#" * count + "." * (total - count)
+
+def _state_players(server_state):
+    players = server_state.get("players", [])
+    if players:
+        return players
+    return [
+        {"name": colour, "colour": colour}
+        for colour in server_state.get("pins", {}).keys()
+    ]
+
+def _render_terminal_dashboard(server_state, my_colour, my_name, rl_agent_desc, game_id):
+    # This keeps the tournament client readable in a plain terminal without
+    # needing the local Tk GUI from main.py.
+    current_turn = server_state.get("current_turn_colour", "-")
+    status = server_state.get("status", "-")
+    move_count = server_state.get("move_count", 0)
+    last_move = server_state.get("last_move")
+
+    print("\033[2J\033[H", end="")
+    print("=" * 76)
+    print(f"CHINESE CHECKERS TOURNAMENT  |  Game {game_id}  |  Status {status}  |  Move {move_count}")
+    print(f"You: {my_name} ({my_colour.upper()})  |  Client: {rl_agent_desc}")
+    print(f"Current turn: {str(current_turn).upper()}")
+    print("-" * 76)
+    print("Players:")
+
+    for player in _state_players(server_state):
+        colour = str(player.get("colour", ""))
+        name = str(player.get("name", colour))
+        home = _pins_in_goal(server_state, colour)
+        dist = _distance_to_goal(server_state, colour)
+        marker = "YOU" if colour == my_colour else ""
+        turn_marker = "*" if colour == current_turn else " "
+        print(
+            f" {turn_marker} {colour.upper():11} {name[:18]:18} "
+            f"[{_progress_bar(home)}] home={home}/10 dist={dist:>3} {marker}"
+        )
+
+    if last_move:
+        print("-" * 76)
+        print(
+            f"Last move: {last_move['by']} ({last_move['colour']}) "
+            f"{last_move['from']}->{last_move['to']}  [{last_move['move_ms']:.1f}ms]"
+        )
+
+    print("-" * 76)
+    print("Board:")
+    _board.print_ascii(pins=_make_pins_on_board(server_state), empty=".")
+    print("=" * 76)
+    sys.stdout.flush()
+
 def try_load_afterstate():
     try:
         from src.afterstate import AfterstateSearchAgent, AfterstateValueAgent
@@ -461,8 +524,8 @@ def main():
     print("Game started\n")
 
     timeoutnotice_move = -1
-    last_move_seen     = 0
     recent_moves       = []
+    last_dashboard_key = None
 
     while True:
         st = rpc({"op": "get_state", "game_id": game_id})
@@ -471,6 +534,15 @@ def main():
             return
 
         state = st["state"]
+        dashboard_key = (
+            state.get("status"),
+            state.get("move_count", 0),
+            state.get("current_turn_colour"),
+            state.get("turn_timeout_notice"),
+        )
+        if dashboard_key != last_dashboard_key:
+            _render_terminal_dashboard(state, colour, name, rl_agent_desc, game_id)
+            last_dashboard_key = dashboard_key
 
         if state.get("turn_timeout_notice") and timeoutnotice_move < state.get("move_count", 0):
             print("WARNING TIMEOUT:", state["turn_timeout_notice"])
@@ -488,12 +560,6 @@ def main():
                           f"pins={sc['pin_goal_score']:.1f}, "
                           f"dist={sc['distance_score']:.1f}]")
             break
-
-        if state["move_count"] > last_move_seen:
-            mv = state.get("last_move")
-            if mv:
-                print(f"MOVE: {mv['by']} ({mv['colour']}) {mv['from']}->{mv['to']}  [{mv['move_ms']:.1f}ms]")
-            last_move_seen = state["move_count"]
 
         if state.get("current_turn_colour") == colour and state["status"] == "PLAYING":
             print("\nMy turn")

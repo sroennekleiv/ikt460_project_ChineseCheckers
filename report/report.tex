@@ -1,0 +1,125 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[top=2cm, bottom=2cm, left=2.5cm, right=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{microtype}
+\usepackage{titlesec}
+\usepackage{lmodern}
+\usepackage{hyperref}
+
+% UiA brand red
+\definecolor{uiared}{RGB}{200, 16, 46}
+\definecolor{lightgray}{RGB}{245, 245, 245}
+
+% Section styling
+\titleformat{\section}
+  {\large\bfseries\color{uiared}}
+  {\thesection.}{0.5em}{}
+  [\color{uiared}\titlerule]
+
+\titleformat{\subsection}
+  {\normalsize\bfseries}
+  {\thesubsection.}{0.5em}{}
+
+\titlespacing*{\section}{0pt}{1.2em}{0.6em}
+\titlespacing*{\subsection}{0pt}{0.8em}{0.3em}
+
+% Nicer table column types
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+\hypersetup{colorlinks=true, linkcolor=uiared, urlcolor=uiared}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{document}
+
+% ── Front Page ────────────────────────────────────────────────────────────────
+\begin{titlepage}
+    \centering
+    \includegraphics[width=0.45\textwidth]{uia_logo.png} \\[2.5cm]
+
+    {\color{gray}\large Faculty of Engineering and Science} \\[0.2em]
+    {\color{gray}\large Department of ICT} \\[2cm]
+
+    {\color{uiared}\rule{\textwidth}{1.5pt}} \\[0.5cm]
+    {\LARGE \textbf{Chinese Checkers Tournament Report}} \\[0.3cm]
+    {\color{uiared}\rule{\textwidth}{1.5pt}} \\[1.5cm]
+
+    {\large \textbf{Course:} IKT460 -- Reinforcement Learning} \\[0.5em]
+    {\large \textbf{Team:} S\&S} \\[2cm]
+
+    {\large
+        Sara Byklum \\[0.4em]
+        Synne Rønnekleiv
+    } \\[3cm]
+
+    {\color{gray}\large \today}
+\end{titlepage}
+
+% ── Content ───────────────────────────────────────────────────────────────────
+
+\section{Chosen Algorithm}
+
+
+\section{Reward Design}
+
+
+\section{Training Mechanism}
+
+
+\section{Unexpected Cases and How We Handled Them}
+
+
+\section{Statistics}
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.4}
+    \begin{tabular}{L{7.5cm} C{4cm}}
+        \rowcolor{uiared}
+        \color{white}\textbf{Metric} & \color{white}\textbf{Value} \\
+        \rowcolor{lightgray}
+        Average time per move (s)  & \\
+        Average moves per game     & \\
+        \rowcolor{lightgray}
+        Average pins in goal       & \\
+        Average distance to target & \\
+        \rowcolor{lightgray}
+        Time score                 & \\
+        Move score                 & \\
+        \rowcolor{lightgray}
+        Pin score                  & \\
+        Distance score             & \\
+        \rowcolor{lightgray}
+        \textbf{Total score}       & \\
+    \end{tabular}
+    \caption{Agent performance statistics.}
+\end{table}
+
+
+\section{Your Score as Obtained in the Tournament}
+
+\begin{table}[H]
+    \centering
+    \renewcommand{\arraystretch}{1.4}
+    \begin{tabular}{L{7.5cm} C{4cm}}
+        \rowcolor{uiared}
+        \color{white}\textbf{Metric} & \color{white}\textbf{Value} \\
+        \rowcolor{lightgray}
+        Final ranking         & \\
+        Points scored         & \\
+        \rowcolor{lightgray}
+        Wins / Losses / Draws & \\
+    \end{tabular}
+    \caption{Tournament results.}
+\end{table}
+
+\end{document}
